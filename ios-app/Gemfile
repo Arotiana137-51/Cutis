@@ -1,0 +1,5 @@
+# Ruby tools used by CI to sign the app and upload it to TestFlight.
+# The exact versions are pinned in Gemfile.lock so every CI build uses the same ones.
+source "https://rubygems.org"
+
+gem "fastlane", "~> 2.241"

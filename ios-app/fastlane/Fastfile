@@ -1,0 +1,151 @@
+# Build script for the iOS app. It runs in GitHub Actions on a macOS runner
+# (see .github/workflows/ios.yml): there is no Mac to run it on by hand.
+#
+#   bundle exec fastlane ios beta     sign the app and upload it to TestFlight
+#
+# The Xcode project must already exist (the workflow runs `xcodegen generate` first).
+
+require "base64"
+require "open3"
+require "tmpdir"
+require_relative "app_config"
+
+# Don't regenerate fastlane/README.md on every run.
+skip_docs
+
+default_platform(:ios)
+
+platform :ios do
+  desc "Sign the app and upload it to TestFlight"
+  lane :beta do
+    config = AppConfig.load
+    problems = AppConfig.problems(config)
+    UI.user_error!("Config/App.xcconfig is not ready:\n- #{problems.join("\n- ")}") unless problems.empty?
+
+    %w[ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 MATCH_PASSWORD GITHUB_TOKEN GITHUB_REPOSITORY].each do |name|
+      UI.user_error!("#{name} is not set. See docs/SETUP.md.") if ENV[name].to_s.strip.empty?
+    end
+
+    # A build number from the clock (UTC, to the minute) is always higher than
+    # the last one, which is what TestFlight requires. Example: 202611160915.
+    build_number = Time.now.utc.strftime("%Y%m%d%H%M")
+    commit = ENV["GITHUB_SHA"].to_s[0, 7]
+    commit = "unknown" if commit.empty?
+    UI.important("Building #{config.display_name} #{config.marketing_version} (#{build_number}) from commit #{commit}")
+
+    # Temporary keychain on the CI machine to hold the signing certificate.
+    setup_ci
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV["ASC_KEY_ID"].strip,
+      issuer_id: ENV["ASC_ISSUER_ID"].strip,
+      key_content: AppConfig.normalize_p8(ENV["ASC_KEY_P8"]),
+      is_key_content_base64: false,
+      duration: 1200,
+      in_house: false
+    )
+
+    # Signing certificate + provisioning profile. The first run creates them
+    # with Apple and stores them, encrypted with MATCH_PASSWORD, on the
+    # `ios-signing` branch of this repository. Later runs reuse them.
+    signing_repo = "#{ENV.fetch('GITHUB_SERVER_URL', 'https://github.com')}/#{ENV['GITHUB_REPOSITORY']}.git"
+    signing_auth = Base64.strict_encode64("x-access-token:#{ENV['GITHUB_TOKEN']}")
+    match(
+      type: "appstore",
+      app_identifier: config.bundle_id,
+      team_id: config.team_id,
+      api_key: api_key,
+      storage_mode: "git",
+      git_url: signing_repo,
+      git_branch: AppConfig::SIGNING_BRANCH,
+      git_basic_authorization: signing_auth,
+      git_full_name: "github-actions[bot]",
+      git_user_email: "41898282+github-actions[bot]@users.noreply.github.com",
+      # setup_ci switches match to read-only; turn that off so the first run
+      # can create the certificate, and so an expired one is renewed.
+      readonly: false
+    )
+    ensure_signing_files_were_saved(signing_repo, signing_auth)
+
+    build_app(
+      project: "Cutis.xcodeproj",
+      scheme: "Cutis",
+      configuration: "Release",
+      export_method: "app-store",
+      export_team_id: config.team_id,
+      export_options: {
+        provisioningProfiles: { config.bundle_id => AppConfig.profile_name(config.bundle_id) }
+      },
+      xcargs: "APP_BUILD_NUMBER=#{build_number} APP_GIT_COMMIT=#{commit}",
+      output_directory: "build",
+      output_name: "Cutis.ipa",
+      buildlog_path: "build/logs"
+    )
+
+    # Upload only. Apple then processes the build on its side and emails you
+    # when it is ready, so we don't keep a paid macOS runner waiting for that.
+    upload_to_testflight(
+      api_key: api_key,
+      app_identifier: config.bundle_id,
+      skip_waiting_for_build_processing: true
+    )
+
+    write_summary([
+      "### Uploaded to TestFlight",
+      "",
+      "| | |",
+      "| --- | --- |",
+      "| App | #{config.display_name} (`#{config.bundle_id}`) |",
+      "| Version | #{config.marketing_version} |",
+      "| Build | #{build_number} |",
+      "| Commit | #{commit} |",
+      "",
+      "Apple is now processing the build. It shows up in the TestFlight app on your " \
+      "iPhone when that finishes (Apple sends an email). The build number above is " \
+      "also shown on the app's screen, so you can tell which build you are running."
+    ])
+  end
+
+  error do |_lane, exception|
+    write_summary([
+      "### The TestFlight build failed",
+      "",
+      "```",
+      exception.message.to_s[0, 1500],
+      "```",
+      "",
+      "Nothing reached TestFlight. Paste this box (or the link to this run) into the chat."
+    ])
+  end
+end
+
+# match reports a failed `git push` as a plain log line and carries on. If we
+# carried on too, every build would create a brand new certificate with Apple
+# until the account ran out. So stop here, loudly, if the files are not saved.
+def ensure_signing_files_were_saved(repo_url, basic_auth)
+  env = {
+    "GIT_TERMINAL_PROMPT" => "0",
+    "GIT_CONFIG_COUNT" => "1",
+    "GIT_CONFIG_KEY_0" => "http.extraheader",
+    "GIT_CONFIG_VALUE_0" => "Authorization: Basic #{basic_auth}"
+  }
+  # Run from outside the checkout so no other git settings interfere.
+  output, status = Open3.capture2e(
+    env, "git", "ls-remote", "--heads", repo_url, AppConfig::SIGNING_BRANCH, chdir: Dir.tmpdir
+  )
+  return if status.success? && output.include?("refs/heads/#{AppConfig::SIGNING_BRANCH}")
+
+  UI.user_error!(
+    "The signing certificate could not be saved to the '#{AppConfig::SIGNING_BRANCH}' branch of this repository. " \
+    "Do not run the build again yet: each run would create another certificate with Apple. " \
+    "See 'Signing files were not saved' in docs/SETUP.md."
+  )
+end
+
+# Adds a short report to the GitHub Actions run page.
+def write_summary(lines)
+  path = ENV["GITHUB_STEP_SUMMARY"]
+  return if path.to_s.empty?
+
+  File.open(path, "a") { |file| file.puts(lines.join("\n")) }
+end

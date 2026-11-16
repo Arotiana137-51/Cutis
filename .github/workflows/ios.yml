@@ -1,0 +1,158 @@
+# iOS pipeline.
+#
+# Three jobs, cheapest first, so macOS minutes are only spent on a build that
+# has every chance of reaching TestFlight:
+#
+#   1. checks      Linux. Runs on every push that touches the iOS app.
+#                  Config lint, project-file lint, pure-Swift unit tests.
+#   2. preflight   Linux. Only for `main` or a manual run. Confirms the config
+#                  and secrets are in place and that Apple accepts the API key.
+#   3. testflight  macOS. Only if 1 and 2 pass. Generates the Xcode project,
+#                  signs the app and uploads it to TestFlight.
+#
+# Setup instructions: docs/SETUP.md
+
+name: iOS
+
+on:
+  push:
+    paths:
+      - "ios-app/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ios-app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Config file is well formed
+        run: ruby scripts/preflight.rb --lint
+
+      - name: Project files are well formed
+        run: |
+          ruby scripts/lint.rb
+          ruby -c fastlane/Fastfile
+
+      - name: Build-script unit tests
+        run: ruby scripts/test_app_config.rb
+
+      - name: Swift package unit tests
+        working-directory: ios-app/Packages/AppCore
+        run: |
+          swift --version
+          swift test
+
+  preflight:
+    name: Ready to build?
+    needs: checks
+    # iOS builds only run for `main` or when started by hand.
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ios-app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+
+      - name: Config, secrets and Apple API key
+        run: ruby scripts/preflight.rb
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+  testflight:
+    name: Build and upload to TestFlight (macOS)
+    needs: preflight
+    # Pinned to macOS 26 for Xcode 26, which Apple requires for uploads.
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      # fastlane match saves the encrypted signing files to the `ios-signing` branch.
+      contents: write
+    # One TestFlight build at a time. A running build is never cancelled part-way
+    # (it may be creating the signing certificate); if several are waiting, only
+    # the newest one runs.
+    concurrency:
+      group: ios-testflight
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ios-app
+    env:
+      LC_ALL: en_US.UTF-8
+      LANG: en_US.UTF-8
+      FASTLANE_SKIP_UPDATE_CHECK: "1"
+      FASTLANE_HIDE_CHANGELOG: "1"
+      FASTLANE_OPT_OUT_USAGE: "YES"
+      FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: "120"
+      FASTLANE_XCODEBUILD_SETTINGS_RETRIES: "4"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Tool versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      # Installs the Ruby gems from Gemfile.lock and caches them between builds.
+      - uses: ruby/setup-ruby@v1
+        with:
+          working-directory: ios-app
+          bundler-cache: true
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate the Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build, sign and upload to TestFlight
+        run: bundle exec fastlane ios beta
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Keep build logs when something fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-build-logs
+          path: ios-app/build/logs
+          if-no-files-found: ignore
+          retention-days: 7

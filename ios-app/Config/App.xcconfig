@@ -1,0 +1,24 @@
+// ----------------------------------------------------------------------------
+// App identity: the ONE place for the app name, bundle ID and Apple Team ID.
+// The Xcode project, the CI build and fastlane all read these values from here.
+//
+// docs/SETUP.md (step 5) explains what to put in each line.
+// The build will not start until the two PLACEHOLDER values are replaced.
+// ----------------------------------------------------------------------------
+
+// [APP_NAME] Name shown under the icon on the phone. "Tattoo Preview" is a working name.
+APP_DISPLAY_NAME = Tattoo Preview
+
+// [BUNDLE_ID] The app's unique ID, exactly as registered at developer.apple.com.
+// Example: com.yourname.tattoopreview
+APP_BUNDLE_ID = BUNDLE_ID_PLACEHOLDER
+
+// [TEAM_ID] Your Apple Developer Team ID: 10 letters and digits. Example: A1B2C3D4E5
+APP_TEAM_ID = TEAM_ID_PLACEHOLDER
+
+// Version shown to testers. Raise it when a new phase ships.
+APP_MARKETING_VERSION = 0.1.0
+
+// Filled in by CI for every build. Leave these two as they are.
+APP_BUILD_NUMBER = 1
+APP_GIT_COMMIT = local
